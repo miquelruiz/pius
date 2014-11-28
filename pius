@@ -375,7 +375,7 @@ def main():
       signer.import_unsigned_keys()
 
   signer.cleanup()
-  SignState.store_signed_keys(dict((x, 'SIGNED') for x in signed_keys))
+  SignState.store_signed_keys(dict((x, SignState.kSIGNED) for x in signed_keys))
 
 if __name__ == '__main__':
   main()

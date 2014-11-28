@@ -1,0 +1,282 @@
+#!/usr/bin/python
+
+# vim:shiftwidth=2:tabstop=2:expandtab:textwidth=80:softtabstop=2:ai:
+#
+# Copyright (c) 2010-present Phil Dibowitz <phil@ipom.com>
+
+'''Determine why signatures from/to a key are not cross-signatures.'''
+
+__author__ = 'Phil Dibowitz <phil@ipom.com>'
+
+import optparse
+import os.path
+import subprocess
+import sys
+
+from libpius import util
+from libpius.constants import *
+from libpius import signer as psigner
+from libpius.state import SignState
+
+class PiusReporter(object):
+  # states a key can be in
+  kSIGNED_AND_UPLOADED = 'SIGNED_AND_NOT_UPLOADED'
+  kSIGNED_BUT_NOT_UPLOADED = 'SIGNED_BUT_NOT_UPLOADED'
+  kNOT_SIGNED = 'NOT_SIGNED'
+  kWILL_NOT_SIGN = 'WILL_NOT_SIGN'
+
+  print 'Loading keyring...'
+  def __init__(self, signer_id, keyring, pius_state):
+    self.signer = signer_id
+    self.keyring = keyring
+    self.pius_state = pius_state
+    self.signed_us = []
+
+    # we can go ahead and load the key list off the keyring,
+    # but we cannot load sigs until the user tells us to incase
+    # they want to refresh them first.
+    signer = psigner.PiusSigner(None, None, keyring, '/usr/bin/gpg',
+                       None, None, None, None, None, None, None, None)
+    self.keys = signer.get_all_keyids()
+    signer = None
+
+    self.need_them_to_upload = []
+    self.need_to_sign = []
+    self.need_sig = []
+
+  def load_keyring(self):
+    self.sigs = self.get_local_sigs(self.keys)
+
+  def generate(self):
+    for key in self.keys:
+      ret = self.we_signed_key(key)
+      if ret == PiusReporter.kSIGNED_BUT_NOT_UPLOADED:
+        self.need_them_to_upload.append(key)
+      elif ret == PiusReporter.kNOT_SIGNED:
+        self.need_to_sign.append(key)
+      if not self.key_signed_us(key):
+        self.need_sig.append(key)
+
+  def report(self):
+    self.report_upload_needed()
+    self.report_need_to_sign()
+    self.report_need_sig()
+
+  def print_uids(self, keys):
+    '''Print UIDs for each key in keys.'''
+    for keyid in keys:
+      print ' ', keyid
+      gpg = os.popen('gpg --fixed-list-mode --with-colons --fingerprint %s'
+                     % keyid)
+      for line in gpg:
+        if line.startswith('uid'):
+          print '    - %s' % line.split(':')[9]
+      gpg.close()
+    return
+
+  def report_upload_needed(self):
+    '''Wrapper for print_uids.'''
+    if not self.need_them_to_upload:
+      return
+    print 'The following people need to upload your signature:'
+    self.print_uids(self.need_them_to_upload)
+    print
+    return
+
+  def report_need_sig(self):
+    '''Wrapper for print_uids.'''
+    if not self.need_sig:
+      return
+    print 'You need a sig from the following keys:'
+    self.print_uids(self.need_sig)
+    print
+    return
+
+  def report_need_to_sign(self):
+    '''Wrapper for print_uids.'''
+    if not self.need_to_sign:
+      return
+    print 'You have not signed the following keys:'
+    self.print_uids(self.need_to_sign)
+    print
+    return
+
+  def get_local_sigs(self, keys):
+    cmd = [
+      '/usr/bin/gpg',
+      '--fixed-list-mode', '--with-colons',
+      '--keyid-format', 'long',
+      '--list-sigs',
+    ] + keys
+    sigs = {}
+    util.debug(cmd)
+    gpg = subprocess.Popen(cmd, close_fds=True, stdout=subprocess.PIPE)
+    current_key = None
+    for line in gpg.stdout:
+      line = line.strip()
+      if line.startswith('pub:'):
+        current_key = line.split(':')[4]
+        continue
+      if not line.startswith('sig:'):
+        continue
+      keyid = line.split(':')[4]
+      if not current_key in sigs:
+        sigs[current_key] = []
+      sigs[current_key].append(keyid)
+    return sigs
+
+  def ask_user(self, key):
+    cmd = [
+      '/usr/bin/gpg',
+      '--no-default-keyring',
+      '--keyring', self.keyring,
+      '--fingerprint', key,
+    ]
+    util.debug(cmd)
+    gpg = subprocess.Popen(
+      cmd,
+      stdout=subprocess.PIPE,
+      close_fds=True
+    )
+    output = gpg.stdout.read()
+    output = output.strip()
+    retval = gpg.wait()
+    if retval != 0:
+      print 'KeyID not found, bailing out!'
+      sys.exit(1)
+    print 'There is no record of you signing this key...'
+    print output
+    print ' (1) I have signed it'
+    print ' (2) I don\'t want to / will not sign it'
+    print ' (3) Oops, report that as something I should sign'
+    ans = None
+    while not ans in ['1', '2', '3']:
+      ans = raw_input('Please choose 1, 2, or 3 > ')
+    if ans == '1':
+      return SignState.kSIGNEDED
+    if ans == '2':
+      return SignState.kWILL_NOT_SIGN
+    if ans == '3':
+      return SignState.kNOT_SIGNED
+
+  def we_signed_key(self, key):
+    # If the local primary keychain includes our signature on their key
+    # we signed it and they uploaded it...
+    if self.signer in self.sigs[key]:
+      return PiusReporter.kSIGNED_AND_UPLOADED
+
+    # If that's not the case, but we recorded signing it, they never uploaded it
+    if self.pius_state.signed(key):
+      return PiusReporter.kSIGNED_BUT_NOT_UPLOADED
+
+    if self.pius_state.will_not_sign(key):
+      return PiusReporter.kWILL_NOT_SIGN
+
+    return PiusReporter.kNOT_SIGNED
+
+  def key_signed_us(self, key):
+    if len(self.signed_us) == 0:
+      self.signed_us = self.get_local_sigs([self.signer])[self.signer]
+
+    return key in self.signed_us
+
+  def check_missing_sign_data(self):
+    unsigned_keys = []
+    for key in self.keys:
+      if key not in self.pius_state and self.signer not in self.sigs[key]:
+        unsigned_keys.append(key)
+    if len(unsigned_keys) > 0:
+      print 'Not all keys on this keyring were signed by you. Would you like me to:'
+      print ' (1) Assume any keys not signed on this keyring are by choice.'
+      print ' (2) Ask about any keys I don\'t know about.'
+      print ' (3) Report them as keys you need to sign.'
+      ans = None
+      while not ans in ['1', '2', '3']:
+        ans = raw_input('Please choose 1, 2, or 3 > ')
+
+      if ans == '1':
+        for key in unsigned_keys:
+          self.pius_state.update(key, SignState.kWILL_NOT_SIGN)
+        return
+
+      if ans == '2':
+        for key in unsigned_keys:
+          ret = ask_user(key, self.keyring)
+          self.pius_state.update(key, ret)
+
+      if ans == '3':
+        return
+
+def refresh_keys(keys):
+  cmd = [
+    '/usr/bin/gpg',
+    '--refresh-keys',
+  ] + keys
+  util.debug(cmd)
+  gpg = subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    close_fds=True
+  )
+  gpg.wait()
+
+
+def main():
+  '''Main.'''
+
+  parser = optparse.OptionParser()
+  parser.add_option('-d', '--debug', action='store_true', dest='debug',
+                    help='Debug')
+  parser.add_option('-s', '--signer', dest='keyid',
+                     help='The key you sign with.')
+  parser.add_option('-r', '--keyring', dest='keyring', help='Party Keyring')
+  parser.add_option('--no-refresh', dest='refresh', action='store_false',
+      default=True)
+
+  options, args = parser.parse_args()
+
+  if options.debug:
+    util.DEBUG_ON = True
+
+  if not options.keyid:
+    print 'Missing signer option'
+    sys.exit(1)
+
+  if len(options.keyid) == 8:
+    print 'You must using long key IDs, for security'
+    sys.exit(1)
+
+  if not options.keyring:
+    print 'Missing keyring option'
+    sys.exit(1)
+
+  print 'Loading PIUS state...'
+  signed_keys = SignState()
+
+  report = PiusReporter(options.keyid, options.keyring, signed_keys)
+
+  if options.refresh:
+    print 'Refreshing keys...'
+    refresh_keys(list(set(report.keys + [options.keyid])))
+
+  report.load_keyring()
+
+  # OK, for any keys we don't have some info on, let's ask
+  report.check_missing_sign_data()
+  # Crunch the numbers...
+  report.generate()
+  # and emit the report
+  report.report()
+
+  if signed_keys.modified:
+    ans = raw_input(
+      'Would you like to save the info about keys you\'ve signed? (y/N) '
+    )
+    if ans.lower() in ('y', 'yes'):
+      signed_keys.save()
+    else:
+      print 'Discarding modified state...'
+
+if __name__ == '__main__':
+  main()
+
