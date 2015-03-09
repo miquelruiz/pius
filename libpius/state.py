@@ -45,6 +45,8 @@ class SignState(object):
 
   @classmethod
   def load_signed_keys(self):
+    if not os.path.exists(SignState.PIUS_SIGNED_KEYS):
+      return dict()
     fp = open(SignState.kPIUS_SIGNED_KEYS, 'r')
     data = fp.read()
     try:
